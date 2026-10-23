@@ -1,0 +1,9 @@
+{
+  "policy": "fcfs",
+  "preset": "vllm",
+  "retention": "none",
+  "seed": 2,
+  "model": "meta-llama/Llama-3.1-8B-Instruct",
+  "git_commit": "fixture",
+  "env": {}
+}
