@@ -1,0 +1,116 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${JOB_NAME}
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/part-of: dagshare
+    app.kubernetes.io/component: run
+    dagshare/matrix: ${MATRIX_NAME}
+    dagshare/preset: ${PRESET_LABEL}
+    dagshare/retention: ${RETENTION_TOKEN}
+    dagshare/seed: "${SEED}"
+    dagshare/user: ${USER_LABEL}
+  annotations:
+    dagshare/run-path: ${RUN_PATH}
+    dagshare/image: ${IMAGE}
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: ${ACTIVE_DEADLINE_S}
+  ttlSecondsAfterFinished: 172800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: dagshare
+        app.kubernetes.io/component: run
+        dagshare/job: ${JOB_NAME}
+        dagshare/matrix: ${MATRIX_NAME}
+        dagshare/preset: ${PRESET_LABEL}
+        dagshare/retention: ${RETENTION_TOKEN}
+        dagshare/seed: "${SEED}"
+        dagshare/user: ${USER_LABEL}
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 90
+      imagePullSecrets:
+        - name: ghcr-pull
+${TOLERATIONS_BLOCK}
+      volumes:
+        - name: results
+          persistentVolumeClaim:
+            claimName: dagshare-results
+        - name: hf-cache
+          persistentVolumeClaim:
+            claimName: dagshare-hf-cache
+            readOnly: true
+        - name: shared
+          emptyDir: {}
+        - name: dshm
+          emptyDir: {medium: Memory, sizeLimit: 2Gi}
+      initContainers:
+        - name: prepare
+          image: ${IMAGE}
+          args: [prepare]
+          env:
+            - {name: RESULTS_DIR, value: /results}
+          resources:
+            requests: {cpu: "1", memory: 256Mi}
+            limits: {cpu: "1", memory: 256Mi}
+          volumeMounts:
+            - {name: results, mountPath: /results, subPath: "${RUN_PATH}"}
+      containers:
+        - name: server
+          image: ${IMAGE}
+          args: [server]
+          env:
+            - {name: MODEL, value: "${RUN_MODEL}"}
+            - {name: POLICY, value: "${POLICY}"}
+            - {name: MAX_MODEL_LEN, value: "${MAX_MODEL_LEN}"}
+            - {name: GPU_MEM_UTIL, value: "${GPU_MEM_UTIL}"}
+            - {name: VLLM_EXTRA_ARGS, value: ${VLLM_EXTRA_ARGS_YAML}}
+            - {name: RUN_OUTPUT_DIR, value: /results}
+            - {name: DONE_FILE, value: /run/dagshare/done}
+            - {name: HF_HUB_OFFLINE, value: "1"}
+            - {name: PRESET, value: "${PRESET}"}
+            - {name: SEED, value: "${SEED}"}
+            - {name: RUN_PATH, value: "${RUN_PATH}"}
+            - {name: IMAGE_REF, value: "${IMAGE}"}
+            - {name: IMAGE_DIGEST, value: "${IMAGE_DIGEST}"}
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+${PRESET_ENV_BLOCK}
+          resources:
+            requests: {cpu: "${SERVER_CPUS}", memory: ${SERVER_MEM}, nvidia.com/gpu: 1}
+            limits: {cpu: "${SERVER_CPUS}", memory: ${SERVER_MEM}, nvidia.com/gpu: 1}
+          volumeMounts:
+            - {name: results, mountPath: /results, subPath: "${RUN_PATH}"}
+            - {name: hf-cache, mountPath: /root/.cache/huggingface, readOnly: true}
+            - {name: shared, mountPath: /run/dagshare}
+            - {name: dshm, mountPath: /dev/shm}
+        - name: loadgen
+          image: ${IMAGE}
+          args: [loadgen]
+          env:
+            - {name: MODEL, value: "${RUN_MODEL}"}
+            - {name: SEED, value: "${SEED}"}
+            - {name: WORKLOAD_FILE, value: "${WORKLOAD_FILE}"}
+            - {name: BASE_URL, value: "http://localhost:8000"}
+            - {name: LOADGEN_CMD, value: ${LOADGEN_CMD_YAML}}
+            - {name: LOADGEN_OUT, value: /run/dagshare/loadgen-out}
+            - {name: RESULTS_DIR, value: /results}
+            - {name: DONE_FILE, value: /run/dagshare/done}
+            - {name: WARMUP_REQUESTS, value: "${WARMUP_REQUESTS}"}
+            - {name: SERVER_READY_TIMEOUT_S, value: "1800"}
+            - {name: HF_HUB_OFFLINE, value: "1"}
+          resources:
+            requests: {cpu: "${LOADGEN_CPUS}", memory: ${LOADGEN_MEM}}
+            limits: {cpu: "${LOADGEN_CPUS}", memory: ${LOADGEN_MEM}}
+          volumeMounts:
+            - {name: results, mountPath: /results, subPath: "${RUN_PATH}"}
+            - {name: hf-cache, mountPath: /root/.cache/huggingface, readOnly: true}
+            - {name: shared, mountPath: /run/dagshare}

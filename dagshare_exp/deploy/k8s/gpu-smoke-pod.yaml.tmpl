@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: dagshare-gpu-smoke
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/part-of: dagshare
+    app.kubernetes.io/component: gpu-smoke
+spec:
+  restartPolicy: Never
+  runtimeClassName: nvidia
+  automountServiceAccountToken: false
+${POD_TOLERATIONS_BLOCK}
+  containers:
+    - name: smoke
+      image: nvidia/cuda:12.8.1-base-ubuntu22.04
+      command: [nvidia-smi]
+      resources:
+        limits: {nvidia.com/gpu: 1}

@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: dagshare-fetch
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/part-of: dagshare
+    app.kubernetes.io/component: fetch
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  terminationGracePeriodSeconds: 1
+${POD_TOLERATIONS_BLOCK}
+  volumes:
+    - name: results
+      persistentVolumeClaim:
+        claimName: dagshare-results
+  containers:
+    - name: fetch
+      image: busybox:1.36
+      command: [sh, -c, "trap 'exit 0' TERM; while true; do sleep 5; done"]
+      resources:
+        requests: {cpu: 100m, memory: 64Mi}
+        limits: {cpu: 100m, memory: 64Mi}
+      volumeMounts:
+        - {name: results, mountPath: /results}
