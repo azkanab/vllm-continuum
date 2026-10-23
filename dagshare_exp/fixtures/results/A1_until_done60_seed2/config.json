@@ -1,0 +1,15 @@
+{
+  "policy": "dagshare",
+  "preset": "A1",
+  "retention": "until_done:60",
+  "seed": 2,
+  "model": "meta-llama/Llama-3.1-8B-Instruct",
+  "git_commit": "fixture",
+  "env": {
+    "DAGSHARE_ALPHA": "0.0",
+    "DAGSHARE_BETA": "0.0",
+    "DAGSHARE_FIT_CHECK": "on",
+    "DAGSHARE_COMPUTE": "on",
+    "KV_RETENTION": "until_done:60"
+  }
+}
