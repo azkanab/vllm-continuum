@@ -1,0 +1,11 @@
+*
+!vllm
+!dagshare_exp
+**/__pycache__
+**/*.pyc
+**/*.so
+vllm/_version.py
+dagshare_exp/deploy/.env
+dagshare_exp/deploy/.rendered
+dagshare_exp/deploy/logs
+dagshare_exp/results
