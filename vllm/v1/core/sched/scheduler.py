@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import dataclasses
 import itertools
+import os
 import time
 from collections import defaultdict
 from collections.abc import Iterable
@@ -16,10 +18,14 @@ from vllm.distributed.kv_transfer.kv_connector.factory import (
 from vllm.distributed.kv_transfer.kv_connector.v1 import (KVConnectorBase_V1,
                                                           KVConnectorRole)
 from vllm.logger import init_logger
+from vllm.utils import cdiv
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.v1.core.encoder_cache_manager import (EncoderCacheManager,
                                                 compute_encoder_budget)
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+from vllm.v1.core.sched.dagshare import (CandidateView, DagShareConfig,
+                                         ReqView, RetentionRule, RunLogger,
+                                         TenantLedger)
 from vllm.v1.core.sched.interface import SchedulerInterface
 from vllm.v1.core.sched.output import (CachedRequestData, NewRequestData,
                                        SchedulerOutput)
@@ -37,6 +43,15 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.core.estimate_with_func import ToolCallEstimator, Continuum_Recorder
 
 logger = init_logger(__name__)
+
+
+def kv_bytes_per_block(kv_cache_config: KVCacheConfig) -> int:
+    """Bytes of KV cache behind one block id, summed over all layers."""
+    total_bytes = sum(t.size for t in kv_cache_config.kv_cache_tensors)
+    if total_bytes > 0 and kv_cache_config.num_blocks > 0:
+        return total_bytes // kv_cache_config.num_blocks
+    return sum(group.kv_cache_spec.page_size_bytes * len(group.layer_names)
+               for group in kv_cache_config.kv_cache_groups)
 
 
 class Scheduler(SchedulerInterface):
@@ -120,6 +135,8 @@ class Scheduler(SchedulerInterface):
             self.policy = SchedulingPolicy.FCFS
         elif self.scheduler_config.policy == "continuum":
             self.policy = SchedulingPolicy.CONTINUUM
+        elif self.scheduler_config.policy == "dagshare":
+            self.policy = SchedulingPolicy.DAGSHARE
         else:
             raise ValueError(
                 f"Unknown scheduling policy: {self.scheduler_config.policy}")
@@ -192,6 +209,200 @@ class Scheduler(SchedulerInterface):
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
 
+        self.retention_rule: Optional[RetentionRule] = None
+        self.dagshare_ledger: Optional[TenantLedger] = None
+        self.dagshare_logger: Optional[RunLogger] = None
+        if self.policy == SchedulingPolicy.DAGSHARE:
+            self._init_dagshare(num_gpu_blocks)
+        elif (self.policy == SchedulingPolicy.CONTINUUM
+              and "KV_RETENTION" in os.environ):
+            self.retention_rule = RetentionRule.from_env("continuum")
+
+    def _init_dagshare(self, num_gpu_blocks: int) -> None:
+        cfg = DagShareConfig.from_env()
+        self.dagshare_config = cfg
+        self.retention_rule = RetentionRule.from_env("dagshare")
+        self.dagshare_bytes_per_block = kv_bytes_per_block(
+            self.kv_cache_config)
+        self.dagshare_ledger = TenantLedger(
+            cfg,
+            total_slots=self.max_num_running_reqs,
+            total_kv_blocks=num_gpu_blocks,
+            bytes_per_block=self.dagshare_bytes_per_block)
+        self.dagshare_logger = RunLogger(cfg)
+        self.dagshare_last_scheduled_tokens: dict[str, int] = {}
+        self.dagshare_last_pick: tuple[Optional[str], str] = (None, "fcfs")
+        self.dagshare_blocked_logged = False
+        self.waiting.set_chooser(self._dagshare_choose)
+        env_settings = {
+            k: v
+            for k, v in os.environ.items()
+            if k.startswith(("DAGSHARE_", "KV_RETENTION"))
+            or k == "RUN_OUTPUT_DIR"
+        }
+        self.dagshare_logger.write_config({
+            "policy": self.policy.value,
+            "model": self.vllm_config.model_config.model,
+            "git_commit": os.environ.get("VLLM_DAGSHARE_GIT_SHA"),
+            "env": env_settings,
+            "dagshare_config": dataclasses.asdict(cfg),
+            "retention": dataclasses.asdict(self.retention_rule),
+            "num_gpu_blocks": num_gpu_blocks,
+            "block_size": self.block_size,
+            "bytes_per_block": self.dagshare_bytes_per_block,
+            "kv_gb": num_gpu_blocks * self.dagshare_bytes_per_block / 1e9,
+            "max_num_running_reqs": self.max_num_running_reqs,
+        })
+
+    def _dagshare_blocks_held(self, request_id: str) -> int:
+        blocks = self.kv_cache_manager.get_blocks(request_id).blocks
+        return sum(len(group) for group in blocks)
+
+    def _dagshare_gb(self, num_blocks: int) -> float:
+        return num_blocks * self.dagshare_bytes_per_block / 1e9
+
+    def _dagshare_req_view(self, request: Request) -> ReqView:
+        return ReqView(
+            request_id=request.request_id,
+            tenant_id=request.tenant_id,
+            job_id=request.job_id,
+            arrival_time=request.arrival_time,
+            blocks_held=self._dagshare_blocks_held(request.request_id),
+            scheduled_tokens=self.dagshare_last_scheduled_tokens.get(
+                request.request_id, 0),
+        )
+
+    def _dagshare_prefix_hit_blocks(self, request: Request) -> int:
+        if (not self.kv_cache_manager.enable_caching
+                or request.num_computed_tokens > 0
+                or (request.sampling_params is not None
+                    and request.sampling_params.prompt_logprobs is not None)):
+            return 0
+        _, num_hit_tokens = (
+            self.kv_cache_manager.coordinator.find_longest_cache_hit(
+                request.block_hashes, request.num_tokens - 1))
+        return num_hit_tokens // self.block_size
+
+    def _dagshare_candidate_view(self, request: Request) -> CandidateView:
+        blocks_needed_now = cdiv(
+            request.num_tokens - request.num_computed_tokens, self.block_size)
+        hit_blocks = (self._dagshare_prefix_hit_blocks(request)
+                      if self.dagshare_config.fit_check else 0)
+        blocks_predicted = max(
+            0,
+            cdiv(request.num_tokens, self.block_size) - hit_blocks -
+            cdiv(request.num_computed_tokens, self.block_size))
+        blocks_predicted += self.dagshare_config.fit_margin_blocks
+        return CandidateView(
+            request_id=request.request_id,
+            tenant_id=request.tenant_id,
+            job_id=request.job_id,
+            arrival_time=request.arrival_time,
+            blocks_needed_now=blocks_needed_now,
+            blocks_predicted=blocks_predicted,
+        )
+
+    def _dagshare_event(self, event: str, request: Optional[Request],
+                        reason: str, num_blocks: int = 0,
+                        tenant_id: Optional[str] = None) -> None:
+        self.dagshare_logger.event(
+            t=time.time(),
+            event=event,
+            request_id=request.request_id if request is not None else None,
+            job_id=request.job_id if request is not None else None,
+            tenant_id=(request.tenant_id
+                       if request is not None else tenant_id),
+            gb=self._dagshare_gb(num_blocks),
+            reason=reason,
+        )
+
+    def _dagshare_choose(self, waiting: list[Request]) -> Optional[Request]:
+        """DagShareRequestQueue chooser: ledger pick, None when blocked."""
+        now = time.time()
+        free_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
+        result = self.dagshare_ledger.pick(
+            [self._dagshare_candidate_view(r) for r in waiting], free_blocks,
+            now)
+        if result.request_id is None:
+            if not self.dagshare_blocked_logged:
+                self.dagshare_blocked_logged = True
+                self._dagshare_event("blocked",
+                                     None,
+                                     result.reason,
+                                     tenant_id=result.tenant_id)
+            return None
+        self.dagshare_last_pick = (result.request_id, result.reason)
+        for request in waiting:
+            if request.request_id == result.request_id:
+                return request
+        return None
+
+    def _dagshare_update_ledger(self) -> None:
+        now = time.time()
+        running = [self._dagshare_req_view(r) for r in self.running]
+        pinned = [self._dagshare_req_view(r) for r, _ in self.pinned_requests]
+        self.dagshare_ledger.update(now, running, pinned)
+        self.dagshare_logger.maybe_log_ledger(
+            now, self.dagshare_ledger, {
+                "gb_running":
+                self._dagshare_gb(sum(v.blocks_held for v in running)),
+                "gb_pinned":
+                self._dagshare_gb(sum(v.blocks_held for v in pinned)),
+                "n_running": len(running),
+                "n_waiting": len(self.waiting),
+                "n_pinned": len(pinned),
+            })
+        self.dagshare_blocked_logged = False
+
+    def _dagshare_on_release(self, request: Request) -> None:
+        now = time.time()
+        self.dagshare_ledger.mark_released(request.tenant_id, now)
+        picked_id, reason = self.dagshare_last_pick
+        self._dagshare_event(
+            "release", request,
+            reason if picked_id == request.request_id else "fcfs",
+            self._dagshare_blocks_held(request.request_id))
+
+    def _dagshare_tenant_rank(self) -> dict[str, int]:
+        return {
+            tenant: rank
+            for rank, tenant in enumerate(
+                self.dagshare_ledger.preemption_order())
+        }
+
+    def _dagshare_unpin_one(self, reason: str) -> Optional[Request]:
+        """Unpin the pinned request of the most over-served tenant."""
+        if not self.pinned_requests:
+            return None
+        rank = self._dagshare_tenant_rank()
+        request, end_time = min(
+            self.pinned_requests,
+            key=lambda p: (rank.get(p[0].tenant_id, len(rank)), -p[1]))
+        self.unpin_request(request, end_time, reason=reason)
+        return request
+
+    def _dagshare_pick_victim(self, request: Request) -> Request:
+        """Running request of the highest-ledger tenant, newest first."""
+        rank = self._dagshare_tenant_rank()
+        candidates = [r for r in self.running if r is not request]
+        if not candidates:
+            candidates = [request]
+        return min(candidates,
+                   key=lambda r: (rank.get(r.tenant_id, len(rank)),
+                                  -r.arrival_time))
+
+    def _retention_pin_seconds(self, request: Request) -> float:
+        if self.retention_rule is None:
+            return self.tool_call_estimator.set_up_pin(request)
+        tool_avg_s = None
+        if request.this_func_call is not None:
+            tool_avg_s = self.tool_call_estimator.get_func_call_exec_time(
+                request.this_func_call)
+        return self.retention_rule.pin_seconds(
+            this_func_call=request.this_func_call,
+            tool_avg_s=tool_avg_s,
+            is_last_step=request.is_last_step)
+
     def pop_running_request_based_on_last_step(self, request: Request) -> tuple[Request, bool]:
         """Pop a request from running queue based on job_id level FCFS and last step."""
         if len(self.running) <= 1:
@@ -235,10 +446,21 @@ class Scheduler(SchedulerInterface):
     
     # TODO (Hanchen) needs to get current time, add with length of pin to put end time of pin
     def pin_request(self, request: Request, length_of_pin: float) -> None:
+        if self.policy == SchedulingPolicy.DAGSHARE:
+            self._dagshare_event(
+                "pin", request, f"retain_{length_of_pin:.3f}s",
+                self._dagshare_blocks_held(request.request_id))
         self.continuum_recorder.request_pinned(request)
         self.pinned_requests.append((request, time.time() + length_of_pin))
 
-    def unpin_request(self, request: Request, end_time: float) -> None:
+    def unpin_request(self,
+                      request: Request,
+                      end_time: float,
+                      reason: str = "expired") -> None:
+        if self.policy == SchedulingPolicy.DAGSHARE:
+            self._dagshare_event(
+                "unpin", request, reason,
+                self._dagshare_blocks_held(request.request_id))
         self.pinned_requests.remove((request, end_time))
         self.continuum_recorder.request_unpinned(request)
         self.kv_cache_manager.free(request)
@@ -274,6 +496,8 @@ class Scheduler(SchedulerInterface):
         # and the "jump decoding" optimization in the future.
         
         self.unpin_requests_regular()
+        if self.policy == SchedulingPolicy.DAGSHARE:
+            self._dagshare_update_ledger()
         
         #Qiuyang (DEBUG) logging all running queue jobs and waiting queue jobs
         logger.debug(f"Running queue jobs: {[req.request_id for req in self.running]}")
@@ -384,6 +608,29 @@ class Scheduler(SchedulerInterface):
                         if preempted_req.request_id in req_to_new_blocks:
                             del req_to_new_blocks[preempted_req.request_id]
                         self.continuum_recorder.request_evicted_from_running_queue(preempted_req)
+                    elif self.policy == SchedulingPolicy.DAGSHARE:
+                        unpinned_req = self._dagshare_unpin_one("preempt")
+                        if unpinned_req is not None:
+                            preempted_req, is_unpin = unpinned_req, True
+                        else:
+                            preempted_req = self._dagshare_pick_victim(
+                                request)
+                            self._dagshare_event(
+                                "preempt", preempted_req, "running_alloc",
+                                self._dagshare_blocks_held(
+                                    preempted_req.request_id))
+                            self.running.remove(preempted_req)
+                            if preempted_req in scheduled_running_reqs:
+                                scheduled_running_reqs.remove(preempted_req)
+                                token_budget += num_scheduled_tokens.pop(
+                                    preempted_req.request_id)
+                                req_to_new_blocks.pop(preempted_req.request_id)
+                                scheduled_spec_decode_tokens.pop(
+                                    preempted_req.request_id, None)
+                                scheduled_encoder_inputs.pop(
+                                    preempted_req.request_id, None)
+                                req_index -= 1
+                            self.continuum_recorder.request_evicted_from_running_queue(preempted_req)
                     else:
                         preempted_req = self.running.pop()
                         self.continuum_recorder.request_evicted_from_running_queue(preempted_req)
@@ -468,6 +715,10 @@ class Scheduler(SchedulerInterface):
                 elif self.policy == SchedulingPolicy.CONTINUUM:
                     #The current implementation is basically giving priority to jobs with less prefill tokens.
                     request = self.waiting.peek_request(self.pinned_requests, self.kv_cache_manager, self.connector)
+                elif self.policy == SchedulingPolicy.DAGSHARE:
+                    request = self.waiting.peek_request()
+                    if request is None:
+                        break
                 else:
                     raise ValueError(f"Invalid policy: {self.policy}")
 
@@ -482,6 +733,8 @@ class Scheduler(SchedulerInterface):
                             request.request_id)
                         if self.policy == SchedulingPolicy.CONTINUUM: 
                             self.waiting.pop_request(self.pinned_requests, self.kv_cache_manager, self.connector)
+                        elif self.policy == SchedulingPolicy.DAGSHARE:
+                            self.waiting.remove_request(request)
                         else:
                             self.waiting.pop_request()
                         skipped_waiting_requests.prepend_request(request)
@@ -496,6 +749,8 @@ class Scheduler(SchedulerInterface):
                     else:
                         if self.policy == SchedulingPolicy.CONTINUUM: 
                             self.waiting.pop_request(self.pinned_requests, self.kv_cache_manager, self.connector)
+                        elif self.policy == SchedulingPolicy.DAGSHARE:
+                            self.waiting.remove_request(request)
                         else:
                             self.waiting.pop_request()
                         skipped_waiting_requests.prepend_request(request)
@@ -637,6 +892,9 @@ class Scheduler(SchedulerInterface):
                                 scheduled_running_reqs.remove(preempted_req)
                             self.kv_cache_manager.free(preempted_req)
                             self.encoder_cache_manager.free(preempted_req)
+                        elif self.policy == SchedulingPolicy.DAGSHARE:
+                            self._dagshare_unpin_one("waiting_alloc")
+                            continue
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -664,6 +922,8 @@ class Scheduler(SchedulerInterface):
 
                 req_index += 1
                 self.running.append(request)
+                if self.policy == SchedulingPolicy.DAGSHARE:
+                    self._dagshare_on_release(request)
                 if self.log_stats:
                     request.record_event(EngineCoreEventType.SCHEDULED,
                                          scheduled_timestamp)
@@ -713,6 +973,8 @@ class Scheduler(SchedulerInterface):
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
+        if self.policy == SchedulingPolicy.DAGSHARE:
+            self.dagshare_last_scheduled_tokens = dict(num_scheduled_tokens)
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
         assert token_budget >= 0
         assert len(self.running) <= self.max_num_running_reqs
@@ -1351,12 +1613,14 @@ class Scheduler(SchedulerInterface):
         #NOTE (Hanchen) this is called when the request is finished
         for req, end_time in self.pinned_requests:
             if req.job_id == request.job_id:
-                self.unpin_request(req, end_time)
+                self.unpin_request(req, end_time, reason="next_request_done")
         
         # TODO (Hanchen) check if we want to pin this memory here for how long, pin them on scheduler level.
         #############
-        if self.policy == SchedulingPolicy.CONTINUUM and not request.is_last_step:
-            length_of_pin = self.tool_call_estimator.set_up_pin(request)
+        if (self.policy in (SchedulingPolicy.CONTINUUM,
+                            SchedulingPolicy.DAGSHARE)
+                and not request.is_last_step):
+            length_of_pin = self._retention_pin_seconds(request)
 
             #print(f"Setting up pin for request {request.request_id} with length {length_of_pin}")
             #Floating point error

@@ -197,7 +197,8 @@ class ToolCallEstimator:
             except Exception as e:
                 logger.warning(f"Error detokenizing/parsing output for request {request.request_id}: {e}")
 
-        request.this_func_call = this_func_call
+        if this_func_call is not None:
+            request.this_func_call = this_func_call
         self.job_to_history[request.job_id].append({
             "departure_time": time.time(),
             "func_call": request.this_func_call

@@ -8,7 +8,7 @@ from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Iterable, Iterator
 from enum import Enum
-from typing import Tuple
+from typing import Callable, Optional, Tuple
 
 from vllm.v1.request import Request
 from vllm.v1.core.kv_cache_manager import KVCacheManager
@@ -20,6 +20,7 @@ class SchedulingPolicy(Enum):
     FCFS = "fcfs"
     PRIORITY = "priority"
     CONTINUUM = "continuum"
+    DAGSHARE = "dagshare"
 
 class RequestQueue(ABC):
     """Abstract base class for request queues."""
@@ -338,6 +339,42 @@ class ContinuumRequestQueue(deque[Request], RequestQueue):
         """Iterate over the queue in reverse order."""
         return super().__reversed__()
 
+class DagShareRequestQueue(FCFSRequestQueue):
+    """FCFS deque whose head is chosen by an optional DAGShare chooser."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._chooser: Optional[Callable[[list[Request]],
+                                         Optional[Request]]] = None
+        self._last_peeked: Optional[Request] = None
+
+    def set_chooser(
+        self, chooser: Optional[Callable[[list[Request]],
+                                         Optional[Request]]]
+    ) -> None:
+        self._chooser = chooser
+
+    def peek_request(self) -> Optional[Request]:
+        """Return the chooser's pick, None if it blocks, else FCFS head."""
+        if not self:
+            raise IndexError("peek from an empty queue")
+        if self._chooser is None:
+            return self[0]
+        self._last_peeked = self._chooser(list(self))
+        return self._last_peeked
+
+    def pop_request(self) -> Request:
+        """Pop the last peeked request if still queued, else re-peek."""
+        request = self._last_peeked
+        self._last_peeked = None
+        if request is None or request not in self:
+            request = self.peek_request()
+            self._last_peeked = None
+        if request is None:
+            return self.popleft()
+        self.remove(request)
+        return request
+
 def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
     """Create request queue based on scheduling policy."""
     if policy == SchedulingPolicy.PRIORITY:
@@ -346,5 +383,7 @@ def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
         return FCFSRequestQueue()
     elif policy == SchedulingPolicy.CONTINUUM:
         return ContinuumRequestQueue()
+    elif policy == SchedulingPolicy.DAGSHARE:
+        return DagShareRequestQueue()
     else:
         raise ValueError(f"Unknown scheduling policy: {policy}")
