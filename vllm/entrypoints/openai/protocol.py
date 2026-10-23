@@ -292,6 +292,7 @@ class ResponsesRequest(OpenAIBaseModel):
     # --8<-- [start:responses-extra-params]
     # Custom fields for job/function-call metadata
     job_id: Optional[str] = None
+    tenant_id: Optional[str] = None
     last_func_call: Optional[str] = None
     is_last_step: Optional[bool] = None
     this_func_call: Optional[str] = None
@@ -364,6 +365,8 @@ class ResponsesRequest(OpenAIBaseModel):
         extra_args: dict[str, Any] = {}
         if self.job_id is not None:
             extra_args["job_id"] = self.job_id
+        if self.tenant_id is not None:
+            extra_args["tenant_id"] = self.tenant_id
         if self.last_func_call is not None:
             extra_args["last_func_call"] = self.last_func_call
         if self.is_last_step is not None:
@@ -633,6 +636,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
     # Custom fields for job/function-call metadata
     job_id: Optional[str] = None
+    tenant_id: Optional[str] = None
     last_func_call: Optional[str] = None
     is_last_step: Optional[bool] = None
     this_func_call: Optional[str] = None
@@ -729,6 +733,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
         # Include custom routing metadata if provided
         if self.job_id is not None:
             extra_args["job_id"] = self.job_id
+        if self.tenant_id is not None:
+            extra_args["tenant_id"] = self.tenant_id
         if self.last_func_call is not None:
             extra_args["last_func_call"] = self.last_func_call
         if self.is_last_step is not None:
@@ -1146,6 +1152,7 @@ class CompletionRequest(OpenAIBaseModel):
 
     # Custom fields for job/function-call metadata
     job_id: Optional[str] = None
+    tenant_id: Optional[str] = None
     last_func_call: Optional[str] = None
     is_last_step: Optional[bool] = None
     this_func_call: Optional[str] = None
@@ -1240,6 +1247,8 @@ class CompletionRequest(OpenAIBaseModel):
         # Include custom routing metadata if provided
         if self.job_id is not None:
             extra_args["job_id"] = self.job_id
+        if self.tenant_id is not None:
+            extra_args["tenant_id"] = self.tenant_id
         if self.last_func_call is not None:
             extra_args["last_func_call"] = self.last_func_call
         if self.is_last_step is not None:

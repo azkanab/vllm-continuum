@@ -25,6 +25,7 @@ class Request:
     def __init__(
         self,
         job_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
         request_id: str = "",
         prompt_token_ids: list[int] = [],
         sampling_params: Optional[SamplingParams] = None,
@@ -46,6 +47,7 @@ class Request:
     ) -> None:
     # TODO (Hanchen) need to input job_id, last_func_call, is_last_step, this_func_call from the API request
         self.job_id = job_id
+        self.tenant_id = tenant_id if tenant_id is not None else "default"
         # NOTE (Hanchen) this i s used for emulation, we have other ways to get this information in real experiment
 
         self.last_func_call = last_func_call
@@ -139,6 +141,7 @@ class Request:
     ) -> "Request":
         # Extract optional job/function-call metadata from sampling_params.extra_args
         job_id = None
+        tenant_id = None
         last_func_call = None
         is_last_step = None
         this_func_call = None
@@ -146,12 +149,14 @@ class Request:
                 request.sampling_params.extra_args is not None:
             extra_args = request.sampling_params.extra_args
             job_id = extra_args.get("job_id")
+            tenant_id = extra_args.get("tenant_id")
             last_func_call = extra_args.get("last_func_call")
             is_last_step = extra_args.get("is_last_step")
             this_func_call = extra_args.get("this_func_call")
 
         return cls(
             job_id=job_id,
+            tenant_id=tenant_id,
             request_id=request.request_id,
             client_index=request.client_index,
             prompt_token_ids=request.prompt_token_ids,

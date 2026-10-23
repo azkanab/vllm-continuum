@@ -23,7 +23,7 @@ else:
 logger = init_logger(__name__)
 
 PreemptionMode = Literal["swap", "recompute"]
-SchedulerPolicy = Literal["fcfs", "priority", "continuum"]
+SchedulerPolicy = Literal["fcfs", "priority", "continuum", "dagshare"]
 
 
 @config
