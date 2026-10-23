@@ -1,0 +1,5 @@
+name: continuum
+policy: continuum
+retention: ttl:2
+env:
+  KV_RETENTION_FAST_TOOLS_ONLY: "true"

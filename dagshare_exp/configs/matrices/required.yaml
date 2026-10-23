@@ -1,0 +1,9 @@
+workload: main
+runs:
+  - {preset: vllm, retentions: [none]}
+  - {preset: continuum, retentions: ["ttl:2"]}
+  - {preset: A0, retentions: ["ttl:2", "until_done:60"]}
+  - {preset: A1, retentions: ["ttl:2", "until_done:60"]}
+  - {preset: A2, retentions: ["ttl:2", "until_done:60"]}
+  - {preset: A3, retentions: ["ttl:2", "until_done:60"]}
+seeds: [1, 2, 3]

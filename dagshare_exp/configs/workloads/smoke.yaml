@@ -1,0 +1,15 @@
+model: meta-llama/Llama-3.1-8B-Instruct
+max_model_len: 32768
+gpu_memory_utilization: 0.9
+duration_s: 120
+warmup_s: 20
+tenants:
+  - id: agent
+    kind: agent
+    traces: traces/synthetic.jsonl
+    jobs_in_flight: 8
+    tool_time_scale: 1.0
+  - id: chat
+    kind: chat
+    source: data/sharegpt.jsonl
+    rate_rps: 2.0

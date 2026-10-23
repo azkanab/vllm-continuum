@@ -1,0 +1,9 @@
+name: A2
+policy: dagshare
+retention: ttl:2
+env:
+  DAGSHARE_COMPUTE: "on"
+  DAGSHARE_FIT_CHECK: "on"
+  DAGSHARE_ALPHA: "1"
+  DAGSHARE_BETA: "0"
+  DAGSHARE_CHARGE_MODE: measured

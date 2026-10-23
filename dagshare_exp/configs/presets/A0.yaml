@@ -1,0 +1,9 @@
+name: A0
+policy: dagshare
+retention: ttl:2
+env:
+  DAGSHARE_COMPUTE: "on"
+  DAGSHARE_FIT_CHECK: "off"
+  DAGSHARE_ALPHA: "0"
+  DAGSHARE_BETA: "0"
+  DAGSHARE_CHARGE_MODE: measured
