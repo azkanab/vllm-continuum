@@ -319,10 +319,21 @@ class Scheduler(SchedulerInterface):
     def _dagshare_choose(self, waiting: list[Request]) -> Optional[Request]:
         """DagShareRequestQueue chooser: ledger pick, None when blocked."""
         now = time.time()
-        free_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
+        candidates = [self._dagshare_candidate_view(r) for r in waiting]
         result = self.dagshare_ledger.pick(
-            [self._dagshare_candidate_view(r) for r in waiting], free_blocks,
-            now)
+            candidates,
+            self.kv_cache_manager.block_pool.get_num_free_blocks(), now)
+        while (result.request_id is None and not self.running
+               and self._dagshare_unpin_one("blocked_idle") is not None):
+            result = self.dagshare_ledger.pick(
+                candidates,
+                self.kv_cache_manager.block_pool.get_num_free_blocks(), now)
+        if result.request_id is None and not self.running:
+            fallback = min(waiting,
+                           key=lambda r: (self.dagshare_ledger.score(
+                               r.tenant_id), r.arrival_time))
+            self.dagshare_last_pick = (fallback.request_id, "idle_fallback")
+            return fallback
         if result.request_id is None:
             if not self.dagshare_blocked_logged:
                 self.dagshare_blocked_logged = True
