@@ -204,7 +204,7 @@ Each subagent runs with `isolation: "worktree"` on its own branch (`ds/<id>`). I
 
 ## Verification
 - **Laptop, no GPU:**
-  - `pytest tests/dagshare -q`
+  - `uv run --no-project --python 3.12 --with pytest pytest --confcutdir=tests/dagshare tests/dagshare -q` (skips the repo-wide conftest that imports torch)
   - `pytest tests/v1/core/test_scheduler.py -q` still passes, so the baselines are untouched
   - loadgen runs against `mock_server.py`
   - `analyze.py` runs on the fixtures
