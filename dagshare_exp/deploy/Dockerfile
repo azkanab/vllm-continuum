@@ -25,7 +25,9 @@ RUN set -eux; \
     if [ -f requirements.txt ]; then reqs="${reqs} -r requirements.txt"; fi; \
     if command -v uv >/dev/null 2>&1; then uv pip install --system --no-cache ${reqs}; \
     else python3 -m pip install --no-cache-dir ${reqs}; fi; \
-    chmod +x deploy/entrypoint.sh
+    chmod +x deploy/entrypoint.sh; \
+    python3 prepare_sharegpt.py --out data/sharegpt.jsonl --cache-dir /tmp/sharegpt; \
+    rm -rf /tmp/sharegpt
 
 ENV VLLM_DAGSHARE_GIT_SHA=${GIT_SHA} \
     PYTHONPATH=/workspace/engine \

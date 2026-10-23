@@ -29,6 +29,7 @@ import pandas as pd
 log = logging.getLogger("dagshare_exp.analyze")
 
 TENANTS = ("agent", "chat")
+IGNORED_TENANTS = ("warmup",)  # deploy/warmup.py traffic, not part of the experiment
 AGENT_TENANT = "agent"
 CHAT_TENANT = "chat"
 OK_STATUSES = {"ok", "success", "finished", "completed", "done"}
@@ -112,6 +113,8 @@ def load_ledger(run_dir: Path) -> list[dict] | None:
     if not path.exists():
         return None
     rows = [r for r in read_jsonl(path) if isinstance(r.get("tenants"), dict)]
+    for r in rows:
+        r["tenants"] = {t: v for t, v in r["tenants"].items() if t not in IGNORED_TENANTS}
     return rows or None
 
 
